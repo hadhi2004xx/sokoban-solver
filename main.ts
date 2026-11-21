@@ -1,6 +1,7 @@
 // Sokoban solver — Argon UBH, sokoban-solver-01-run-20261121.
 // Pass 1: I/O + room decomposition + push-BFS (push-optimal, basic pruning).
-// Pass 2: A* with min-cost matching heuristic for speed.
+// Pass 2: A* with a min-cost box->goal matching heuristic (admissible, so the
+// first goal found is still push-optimal), plain push-BFS as fallback.
 // Deterministic: fixed work budgets only, never the wall clock, no randomness.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -14,8 +15,9 @@ const DIRS = [
   { dr: 0, dc: -1, ch: 'l' },
   { dr: 0, dc: 1, ch: 'r' },
 ];
-// Fixed work budget per room (deterministic, never clock-based).
-const MAX_EXPANSIONS = 2000000;
+// Fixed work budgets per room (deterministic, never clock-based).
+const MAX_EXPANSIONS_ASTAR = 400000;
+const MAX_EXPANSIONS_BFS = 2000000;
 
 function parseLevel(text) {
   const lines = text.replace(/\r/g, '').split('\n');
@@ -45,7 +47,7 @@ function parseLevel(text) {
 // Split the level into rooms. The hallway is the player's row (fallback: column).
 // Each room is one connected component of non-hallway floor, entered through a
 // single door cell. The player enters a room from the hallway cell next to the
-// door (the "entry" cell); a box may sit on the door cell and must be pushed in.
+// door (the "entry" cell); a box may sit on the door cell and be pushed in.
 function decompose(L) {
   const { W, H, wall, player } = L;
   const pr = Math.floor(player / W);
@@ -102,8 +104,8 @@ function decomposeAxis(L, axis, line) {
   return { rooms, axis, line };
 }
 
-// Flood fill over `space` (a Set of cells) avoiding boxes; returns the set of
-// reachable cells and the smallest cell index in it (canonical player position).
+// Flood fill over `space` avoiding boxes; returns the reachable set and the
+// smallest cell index in it (canonical player position).
 function region(L, space, boxesSet, start) {
   const { W, H } = L;
   const seen = new Set([start]);
@@ -162,6 +164,22 @@ function bfsPath(L, space, boxesSet, from, to) {
   return null;
 }
 
+// All permutations of [0..n-1] as index arrays (n is 3 or 4 here).
+function permutations(n) {
+  const out = [];
+  const a = [...Array(n).keys()];
+  const gen = (k) => {
+    if (k === 1) { out.push(a.slice()); return; }
+    for (let i = 0; i < k; i++) {
+      gen(k - 1);
+      const j = k % 2 ? 0 : i;
+      [a[j], a[k - 1]] = [a[k - 1], a[j]];
+    }
+  };
+  gen(n);
+  return out;
+}
+
 // Solve one room push-optimally from its entry cell. Returns the move string
 // from the entry cell back to the entry cell with every box on a goal, or null.
 function solveRoom(L, room) {
@@ -172,6 +190,29 @@ function solveRoom(L, room) {
   const boxes0 = L.boxes.filter((b) => roomSet.has(b)).sort((a, b) => a - b);
   const goals = room.cells.filter((x) => goal[x]);
   if (boxes0.length !== goals.length) return null;
+
+  // Push distances between room cells (boxes ignored): BFS from each cell.
+  const dist = new Map();
+  for (const s of room.cells) {
+    const d = new Map([[s, 0]]);
+    const q = [s];
+    let head = 0;
+    while (head < q.length) {
+      const x = q[head++];
+      const r = Math.floor(x / W);
+      const c = x % W;
+      for (const { dr, dc } of DIRS) {
+        const nr = r + dr;
+        const nc = c + dc;
+        if (nr < 0 || nr >= H || nc < 0 || nc >= W) continue;
+        const y = nr * W + nc;
+        if (!roomSet.has(y) || d.has(y)) continue;
+        d.set(y, d.get(x) + 1);
+        q.push(y);
+      }
+    }
+    dist.set(s, d);
+  }
 
   // Dead cells: reverse-push reachability from the goals (superset of live
   // cells; safe to prune). A box at x could have come from x-d pushed in
@@ -222,16 +263,26 @@ function solveRoom(L, room) {
   };
 
   const keyOf = (boxes, canon) => boxes.join(',') + '|' + canon;
-  const startReg = region(L, space, new Set(boxes0), room.entry);
-  const closed = new Set([keyOf(boxes0, startReg.min)]);
-  const queue = [{ boxes: boxes0, player: room.entry, parent: null, pushBox: -1, pushDir: -1 }];
-  let head = 0;
-  let expansions = 0;
-  let found = null;
-  while (head < queue.length) {
-    const node = queue[head++];
-    if (isGoalState(node)) { found = node; break; }
-    if (++expansions > MAX_EXPANSIONS) return null;
+
+  // Min-cost matching of boxes to goals over push distances (admissible:
+  // one push moves one box one cell, so the matching cost drops by <= 1).
+  const perms = permutations(boxes0.length);
+  const heuristic = (boxes) => {
+    let best = Infinity;
+    for (const p of perms) {
+      let s = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        const d = dist.get(boxes[i]).get(goals[p[i]]);
+        if (d === undefined) { s = Infinity; break; }
+        s += d;
+      }
+      if (s < best) best = s;
+    }
+    return best;
+  };
+
+  // Successor pushes from a node: {boxes, player, canon, pushBox, pushDir}.
+  function* successors(node) {
     const boxesSet = new Set(node.boxes);
     const reg = region(L, space, boxesSet, node.player);
     for (let bi = 0; bi < node.boxes.length; bi++) {
@@ -251,14 +302,93 @@ function solveRoom(L, room) {
         const nbSet = new Set(nb);
         if (deadlock2x2(nbSet)) continue;
         const nreg = region(L, space, nbSet, b);
-        const key = keyOf(nb, nreg.min);
-        if (closed.has(key)) continue;
-        closed.add(key);
-        queue.push({ boxes: nb, player: b, parent: node, pushBox: b, pushDir: di });
+        yield { boxes: nb, player: b, canon: nreg.min, pushBox: b, pushDir: di };
       }
     }
   }
+
+  const startReg = region(L, space, new Set(boxes0), room.entry);
+  const start = { boxes: boxes0, player: room.entry, canon: startReg.min, parent: null, pushBox: -1, pushDir: -1, g: 0 };
+
+  let found = searchAStar();
+  if (!found) found = searchBFS();
   if (!found) return null;
+
+  function searchAStar() {
+    // Binary heap ordered by (f, -g, seq): deterministic tie-breaking.
+    const heap = [];
+    let seq = 0;
+    const cmp = (a, b) => (a.f - b.f) || (b.g - a.g) || (a.seq - b.seq);
+    const heapPush = (n) => {
+      heap.push(n);
+      let i = heap.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (cmp(heap[i], heap[p]) >= 0) break;
+        [heap[i], heap[p]] = [heap[p], heap[i]];
+        i = p;
+      }
+    };
+    const heapPop = () => {
+      const top = heap[0];
+      const last = heap.pop();
+      if (heap.length) {
+        heap[0] = last;
+        let i = 0;
+        for (;;) {
+          const l = 2 * i + 1;
+          const r = l + 1;
+          let m = i;
+          if (l < heap.length && cmp(heap[l], heap[m]) < 0) m = l;
+          if (r < heap.length && cmp(heap[r], heap[m]) < 0) m = r;
+          if (m === i) break;
+          [heap[i], heap[m]] = [heap[m], heap[i]];
+          i = m;
+        }
+      }
+      return top;
+    };
+    const best = new Map([[keyOf(start.boxes, start.canon), 0]]);
+    const root = { ...start, h: heuristic(start.boxes), f: 0, seq: seq++ };
+    root.f = root.h;
+    heapPush(root);
+    let expansions = 0;
+    while (heap.length) {
+      const node = heapPop();
+      if (node.g > (best.get(keyOf(node.boxes, node.canon)) ?? Infinity)) continue;
+      if (isGoalState(node)) return node;
+      if (++expansions > MAX_EXPANSIONS_ASTAR) return null;
+      for (const s of successors(node)) {
+        const key = keyOf(s.boxes, s.canon);
+        const g = node.g + 1;
+        if (g >= (best.get(key) ?? Infinity)) continue;
+        best.set(key, g);
+        const h = heuristic(s.boxes);
+        if (h === Infinity) continue;
+        heapPush({ ...s, parent: node, g, h, f: g + h, seq: seq++ });
+      }
+    }
+    return null;
+  }
+
+  function searchBFS() {
+    const closed = new Set([keyOf(start.boxes, start.canon)]);
+    const queue = [{ ...start }];
+    let head = 0;
+    let expansions = 0;
+    while (head < queue.length) {
+      const node = queue[head++];
+      if (isGoalState(node)) return node;
+      if (++expansions > MAX_EXPANSIONS_BFS) return null;
+      for (const s of successors(node)) {
+        const key = keyOf(s.boxes, s.canon);
+        if (closed.has(key)) continue;
+        closed.add(key);
+        queue.push({ ...s, parent: node, g: node.g + 1 });
+      }
+    }
+    return null;
+  }
 
   // Reconstruct the push list, then replay it with walking moves.
   const pushes = [];
