@@ -2,6 +2,9 @@
 // Pass 1: I/O + room decomposition + push-BFS (push-optimal, basic pruning).
 // Pass 2: A* with a min-cost box->goal matching heuristic (admissible, so the
 // first goal found is still push-optimal), plain push-BFS as fallback.
+// Pass 3: goal-on-door rooms are trapping (a box ends on the door cell, so the
+// player can never exit that room); solve them relaxed and last. Strict-first
+// keeps every normal room byte-identical to Pass 2.
 // Deterministic: fixed work budgets only, never the wall clock, no randomness.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -180,9 +183,12 @@ function permutations(n) {
   return out;
 }
 
-// Solve one room push-optimally from its entry cell. Returns the move string
-// from the entry cell back to the entry cell with every box on a goal, or null.
-function solveRoom(L, room) {
+// Solve one room push-optimally from its entry cell. Returns {moves, trapped}
+// where moves runs from the entry cell (back to the entry cell when trapped
+// is false; ending inside the room when trapped is true), or null.
+// allowTrapped: when false, a goal state must let the player walk back to the
+// entry; when true, every box on a goal is enough (the player may end inside).
+function solveRoom(L, room, allowTrapped) {
   const { W, H, wall, goal } = L;
   const roomSet = new Set(room.cells);
   const space = new Set(room.cells);
@@ -258,6 +264,7 @@ function solveRoom(L, room) {
 
   const isGoalState = (node) => {
     for (const b of node.boxes) if (!goal[b]) return false;
+    if (allowTrapped) return true;
     const reg = region(L, space, new Set(node.boxes), node.player);
     return reg.set.has(room.entry);
   };
@@ -409,35 +416,63 @@ function solveRoom(L, room) {
     player = box;
   }
   const exit = bfsPath(L, space, new Set(boxes), player, room.entry);
-  if (exit === null) return null;
+  if (exit === null) {
+    // No way back to the entry: only legal when the caller allowed a trapped
+    // finish (a box sits on the door goal). The level still solves: the
+    // checker only needs every box on a goal at the end of the replay.
+    if (!allowTrapped) return null;
+    return { moves, trapped: true };
+  }
   moves += exit;
-  return moves;
+  return { moves, trapped: false };
 }
 
 function solveLevel(text) {
   const L = parseLevel(text);
   const dec = decompose(L);
   if (!dec) return '';
-  // Solve rooms left-to-right by door column.
+  // Solve rooms left-to-right by door column. A room whose door cell is a
+  // goal traps the player (a box ends on the door, the only way out), so it
+  // is solved relaxed and applied last; two trapping rooms make the level
+  // unsolvable (the player can only end inside one of them).
   const rooms = dec.rooms.slice().sort((a, b) => a.door - b.door);
   let player = L.player;
   let boxes = L.boxes.slice();
   let moves = '';
   const allSpace = new Set();
   for (let i = 0; i < L.W * L.H; i++) if (!L.wall[i]) allSpace.add(i);
-  for (const room of rooms) {
-    const path = bfsPath(L, allSpace, new Set(boxes), player, room.entry);
-    if (path === null) return '';
-    moves += path;
-    const rm = solveRoom(L, room);
-    if (rm === null) return '';
-    moves += rm;
-    player = room.entry;
-    // Update global boxes: room boxes are now on goals.
+  const applyRoom = (room, res) => {
     const roomGoals = room.cells.filter((x) => L.goal[x]);
     const roomBoxes = new Set(room.cells.filter((x) => boxes.includes(x)));
     boxes = boxes.filter((b) => !roomBoxes.has(b)).concat(roomGoals);
     boxes.sort((a, b) => a - b);
+    return res;
+  };
+  let deferred = null;
+  for (const room of rooms) {
+    // Strict first: identical behaviour to Pass 2 for every normal room.
+    let res = solveRoom(L, room, false);
+    if (!res) {
+      res = solveRoom(L, room, true);
+      if (!res) return '';
+      if (res.trapped) {
+        if (deferred) return '';
+        deferred = { room, res };
+        continue;
+      }
+    }
+    const path = bfsPath(L, allSpace, new Set(boxes), player, room.entry);
+    if (path === null) return '';
+    moves += path + res.moves;
+    player = room.entry;
+    applyRoom(room, res);
+  }
+  if (deferred) {
+    const path = bfsPath(L, allSpace, new Set(boxes), player, deferred.room.entry);
+    if (path === null) return '';
+    moves += path + deferred.res.moves;
+    applyRoom(deferred.room, deferred.res);
+    // Player ends inside the trapping room; the level is solved anyway.
   }
   return moves;
 }
